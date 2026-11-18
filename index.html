@@ -1,1 +1,705 @@
+import express from "express";
+import { createServer } from "http";
+import { Server as SocketIO } from "socket.io";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { createClient } from "redis";
+import path from "path";
+import { existsSync, readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import cors from "cors";
+import "dotenv/config";
+import { Op } from "sequelize";
+import {
+  createCompression,
+  setNoStoreHeaders,
+  staticOptions,
+} from "./utils/httpPerformance.js";
 
+import { mountProxyAssets } from "./utils/proxyAssets.js";
+import { mountAds } from "./utils/ads.js";
+import { mountGameAssetFallback } from "./utils/gameAssets.js";
+import { mountLegacyPlayRedirects } from "./utils/legacyPlayPages.js";
+import { renewSessionCookie, verifyScopedToken } from "./utils/sessionToken.js";
+
+// Production runs the Rust Wisp server (epoxy-server) beside this one, and
+// Caddy sends /api/live/ and /wisp/ to it (docs/proxy-stack.md). Everywhere
+// else (Codespaces, forks, a local copy) this process serves Wisp itself.
+const wispExternal = process.env.WISP_SERVER === "external";
+let wisp = null;
+if (!wispExternal) {
+  const { server, logging } = await import("@mercuryworkshop/wisp-js/server");
+  logging.set_level(logging.ERROR);
+  wisp = server;
+}
+
+import searchRoutes from "./routes/search.js";
+import proxyRoutes from "./routes/music.js";
+import { createKrillionRouter } from "./routes/krillion.js";
+import { warmKrillion } from "./services/krillion.js";
+import {
+  disabledPageRedirect,
+  inCodespaces,
+  loadFeatures,
+} from "./utils/features.js";
+
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+
+  // Production serves the built site (npm run build, see docs/deploy.md).
+  // Precedence: explicit STATIC_ROOT env > built tree if present > static/.
+  // The path stays lexical (no realpath) so a dist/current symlink swap is
+  // served on the next request without a restart.
+  const builtStatic = path.resolve(__dirname, "dist/current/static");
+  const staticRoot = path.resolve(
+    __dirname,
+    process.env.STATIC_ROOT ||
+      (existsSync(builtStatic) ? builtStatic : "static"),
+  );
+  if (!existsSync(staticRoot)) {
+    throw new Error(`STATIC_ROOT ${staticRoot} does not exist`);
+  }
+
+  // manifest.json sits beside the resolved root (built tree only). routes is
+  // empty for now and nothing consumes it yet; a bad manifest never stops boot.
+  let manifest = { routes: {} };
+  const manifestPath = path.join(path.dirname(staticRoot), "manifest.json");
+  if (existsSync(manifestPath)) {
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    } catch (e) {
+      console.warn(`[static] ignoring unreadable manifest: ${e.message}`);
+    }
+  }
+
+  // Chat and accounts load only when their env is set, so a server with no
+  // .env (a fresh Codespace, say) still serves games, apps and the proxy.
+  const features = await loadFeatures();
+  const { UserStatus, ChatMember } = features.models ?? {};
+  // Loaded only with chat, like the models: it reaches the account store.
+  const userCache = features.chat
+    ? (await import("./utils/userCache.js")).default
+    : null;
+  const port = process.env.PORT || 8080;
+
+  const app = express();
+  app.use(createCompression());
+  mountProxyAssets(app);
+  mountAds(app, { accounts: features.accounts });
+  const server = createServer(app);
+
+  const io = new SocketIO({
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"],
+    },
+  });
+
+  io.attach(server);
+
+  let redisPubClient;
+  let redisSubClient;
+
+  async function configureSocketAdapter() {
+    if (!process.env.REDIS_URL) {
+      console.warn(
+        "REDIS_URL is not set. Socket.IO will only coordinate within this Node process.",
+      );
+      return;
+    }
+
+    redisPubClient = createClient({ url: process.env.REDIS_URL });
+    redisSubClient = redisPubClient.duplicate();
+
+    redisPubClient.on("error", (error) => {
+      console.error("Redis pub client error:", error);
+    });
+    redisSubClient.on("error", (error) => {
+      console.error("Redis sub client error:", error);
+    });
+
+    await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
+    io.adapter(createAdapter(redisPubClient, redisSubClient));
+    console.log("✅ Socket.IO Redis adapter connected.");
+  }
+
+  async function hasOtherUserSocket(userUuid, currentSocketId) {
+    const sockets = await io.in(`user_${userUuid}`).fetchSockets();
+    return sockets.some((userSocket) => userSocket.id !== currentSocketId);
+  }
+
+  function leaveAuthenticatedRooms(socket) {
+    for (const room of socket.rooms) {
+      if (
+        room !== socket.id &&
+        (room.startsWith("user_") || room.startsWith("chat_"))
+      ) {
+        socket.leave(room);
+      }
+    }
+  }
+
+  async function markUserOffline(userUuid, lastSeen) {
+    await UserStatus.update(
+      {
+        isOnline: false,
+        lastSeen,
+        socketId: null,
+      },
+      { where: { userUuid } },
+    );
+
+    io.emit("user_status_change", {
+      userUuid,
+      isOnline: false,
+      lastSeen,
+    });
+  }
+
+  if (features.billing) {
+    // Ahead of express.json: the signature covers the raw request body.
+    const { stripeWebhook } = await import("./routes/billing.js");
+    app.post(
+      "/api/stripe/webhook",
+      express.raw({ type: "application/json" }),
+      stripeWebhook,
+    );
+  }
+
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+  app.use(cors());
+
+  app.use((req, res, next) => {
+    if (path.extname(req.url) === ".js") {
+      res.setHeader("Content-Type", "application/javascript");
+    }
+    next();
+  });
+
+  // API answers depend on who is asking. Without this, a CDN in front of the
+  // site (the Bunny pull zones cache for 30 days) serves one account's
+  // /api/me, saves or chats to everyone. Routes that want caching set their
+  // own header (/api/music and /api/autocomplete do).
+  app.use("/api", (req, res, next) => {
+    setNoStoreHeaders(res);
+    next();
+  });
+
+  // The Krillion daily game's API, from the day's cached answers. It needs no
+  // account or database, so it sits ahead of the feature switches below.
+  app.use("/api/krillion", createKrillionRouter());
+  warmKrillion();
+
+  if (features.accounts) {
+    const [auth, users, admin] = await Promise.all([
+      import("./routes/auth.js"),
+      import("./routes/users.js"),
+      import("./routes/admin.js"),
+    ]);
+    app.use("/api", (req, res, next) => {
+      if (req.path !== "/logout") renewSessionCookie(req, res);
+      next();
+    });
+    app.use("/api", auth.default);
+    app.use("/api", users.createUsersRouter({ perGameSaves: features.saves }));
+    if (features.saves) {
+      const saves = await import("./routes/saves.js");
+      app.use("/api", saves.createSavesRouter({ io }));
+    }
+    if (features.billing) {
+      const [billing, { recomputePremium }] = await Promise.all([
+        import("./routes/billing.js"),
+        import("./services/billing.js"),
+      ]);
+      app.use("/api", billing.default);
+      app.use("/api", admin.createAdminRouter({ recomputePremium }));
+    } else {
+      app.use("/api", admin.default);
+    }
+    if (features.onev1) {
+      const [{ createOneV1Router }, game, coins] = await Promise.all([
+        import("./routes/onev1.js"),
+        import("./services/onev1.js"),
+        import("./services/onev1Coins.js"),
+      ]);
+      app.use(
+        "/api",
+        createOneV1Router({ game, coins, billing: features.billing }),
+      );
+    }
+  }
+  if (features.chat) {
+    const messaging = await import("./routes/messaging.js");
+    app.use("/api", messaging.default);
+  }
+  app.use("/api", searchRoutes);
+  app.use("/api/music", proxyRoutes);
+
+  // Calls to a feature that is off are answered in JSON, which is what its
+  // callers parse, instead of the 404 page.
+  const featureOff = (req, res) => {
+    res.status(503).json({ error: "This feature is off on this server" });
+  };
+  if (!features.billing) {
+    app.use(["/api/billing", "/api/stripe"], featureOff);
+  }
+  if (!features.onev1) {
+    app.use("/api/1v1", featureOff);
+  }
+  if (!features.saves) {
+    app.use(
+      [
+        "/api/saves",
+        "/api/saves-sync",
+        "/api/saves-socket-token",
+        "/api/saves-keys",
+      ],
+      featureOff,
+    );
+  }
+  if (!features.accounts || !features.chat) {
+    // What is left under /api belongs to a feature that is off.
+    app.use("/api", featureOff);
+  }
+  if (!features.accounts || !features.chat || !features.billing) {
+    app.use(disabledPageRedirect(features));
+  }
+
+  io.on("connection", (socket) => {
+    // Cloud save notices: a device joins its account's room with a token
+    // from /api/saves-socket-token, since the handshake carries no session
+    // cookie. The room only ever hears which game changed, never a save.
+    if (features.saves) {
+      socket.on("saves_subscribe", (data) => {
+        const uuid = verifyScopedToken(data?.token, "saves");
+        if (!uuid) return socket.emit("saves_error", "sign_in_again");
+        for (const room of socket.rooms) {
+          if (room.startsWith("saves_")) socket.leave(room);
+        }
+        socket.join(`saves_${uuid}`);
+        socket.emit("saves_subscribed");
+      });
+    }
+
+    // Every handler below is chat or presence, and all of them use the database.
+    if (!features.chat) return;
+
+    socket.on("authenticate", async (data) => {
+      try {
+        const { uuid, joinChatRooms = false } = data;
+        if (!uuid) return;
+
+        const previousUuid = socket.data.userUuid;
+        if (previousUuid && previousUuid !== uuid) {
+          socket.data.userUuid = null;
+          socket.data.activeChat = null;
+          leaveAuthenticatedRooms(socket);
+
+          if (!(await hasOtherUserSocket(previousUuid, socket.id))) {
+            await markUserOffline(previousUuid, new Date());
+          }
+        }
+
+        await UserStatus.upsert({
+          userUuid: uuid,
+          isOnline: true,
+          lastSeen: new Date(),
+          socketId: socket.id,
+        });
+
+        socket.data.userUuid = uuid;
+        socket.data.activeChat = null;
+        socket.join(`user_${uuid}`);
+
+        if (joinChatRooms) {
+          const userChats = await ChatMember.findAll({
+            where: { userUuid: uuid },
+            attributes: ["chatId"],
+            raw: true,
+          });
+
+          userChats.forEach((chatMember) => {
+            socket.join(`chat_${chatMember.chatId}`);
+          });
+        }
+
+        socket.broadcast.emit("user_status_change", {
+          userUuid: uuid,
+          isOnline: true,
+        });
+      } catch (error) {
+        console.error("Error during authentication:", error);
+      }
+    });
+
+    socket.on("join_chat", (chatId) => {
+      if (!socket.data.userUuid) return;
+      socket.join(`chat_${chatId}`);
+    });
+
+    socket.on("leave_chat", (chatId) => {
+      socket.leave(`chat_${chatId}`);
+    });
+
+    socket.on("viewing_chat", (chatId) => {
+      if (!socket.data.userUuid) return;
+      socket.data.activeChat = chatId;
+    });
+
+    socket.on("stop_viewing_chat", () => {
+      socket.data.activeChat = null;
+    });
+
+    socket.on("send_message", async (data) => {
+      try {
+        const { chatId, content, senderUuid, isSystem } = data;
+
+        const authenticatedUuid = socket.data.userUuid;
+        if (authenticatedUuid !== senderUuid && !isSystem) {
+          return socket.emit("error", "Authentication mismatch");
+        }
+
+        // The name shown to the room comes from the account, never from the
+        // client, so nobody can post under another handle.
+        let finalSenderUsername = "System";
+        let senderAvatar = null;
+        let senderPremium = false;
+        if (!isSystem) {
+          finalSenderUsername = "Unknown User";
+          try {
+            let sender = await userCache.getUserByUuid(senderUuid);
+            if (sender.handlePending) {
+              // The cache can be minutes behind a handle chosen on another
+              // worker, so the account is read again before refusing.
+              userCache.invalidateUser(senderUuid);
+              sender = await userCache.getUserByUuid(senderUuid);
+              if (sender.handlePending) {
+                return socket.emit(
+                  "error",
+                  "Choose your handle to send messages",
+                );
+              }
+            }
+            finalSenderUsername = sender.username;
+            senderAvatar = sender.avatar || null;
+            senderPremium = Boolean(sender.premium);
+          } catch (error) {
+            // Unknown sender: the message is still relayed, unnamed.
+          }
+        }
+
+        socket.to(`chat_${chatId}`).emit("new_message", {
+          chatId,
+          content,
+          senderUuid,
+          senderUsername: finalSenderUsername,
+          senderAvatar,
+          senderPremium,
+          timestamp: new Date(),
+          isSystem: isSystem || false,
+        });
+
+        // lastActivity is already updated by the REST call that stored the message
+        const chatMembers = await ChatMember.findAll({
+          where: { chatId },
+          attributes: ["userUuid"],
+          raw: true,
+        });
+
+        await Promise.all(
+          chatMembers
+            .filter((member) => member.userUuid !== senderUuid)
+            .map(async (member) => {
+              const userSockets = await io
+                .in(`user_${member.userUuid}`)
+                .fetchSockets();
+
+              const isCurrentlyViewing = userSockets.some(
+                (userSocket) =>
+                  String(userSocket.data.activeChat) === String(chatId),
+              );
+
+              if (!isCurrentlyViewing) {
+                socket
+                  .to(`user_${member.userUuid}`)
+                  .emit("new_message_notification", {
+                    chatId,
+                    content,
+                    senderUuid,
+                    senderUsername: finalSenderUsername,
+                    timestamp: new Date(),
+                    isSystem: isSystem || false,
+                  });
+              }
+            }),
+        );
+      } catch (error) {
+        console.error("Error handling message:", error);
+        socket.emit("error", "Failed to send message");
+      }
+    });
+
+    socket.on("typing_start", (data) => {
+      const { chatId, senderUuid } = data;
+      socket.to(`chat_${chatId}`).emit("user_typing", {
+        chatId,
+        userUuid: senderUuid,
+        isTyping: true,
+      });
+    });
+
+    socket.on("typing_stop", (data) => {
+      const { chatId, senderUuid } = data;
+      socket.to(`chat_${chatId}`).emit("user_typing", {
+        chatId,
+        userUuid: senderUuid,
+        isTyping: false,
+      });
+    });
+
+    socket.on("mark_read", async (data) => {
+      try {
+        const { chatId } = data;
+        const userUuid = socket.data.userUuid;
+
+        if (!userUuid) return;
+
+        await ChatMember.update(
+          { lastReadAt: new Date() },
+          { where: { chatId, userUuid } },
+        );
+
+        socket.to(`chat_${chatId}`).emit("messages_read", {
+          chatId,
+          userUuid,
+          readAt: new Date(),
+        });
+      } catch (error) {
+        console.error("Error marking messages as read:", error);
+      }
+    });
+
+    socket.on("heartbeat", async (data) => {
+      try {
+        const { uuid } = data;
+        if (!uuid) return;
+        if (socket.data.userUuid !== uuid) return;
+
+        await UserStatus.upsert({
+          userUuid: uuid,
+          isOnline: true,
+          lastSeen: new Date(),
+          socketId: socket.id,
+        });
+      } catch (error) {
+        console.error("Error handling heartbeat:", error);
+      }
+    });
+
+    socket.on("disconnecting", async () => {
+      const userUuid = socket.data.userUuid;
+      socket.data.activeChat = null;
+
+      if (!userUuid || (await hasOtherUserSocket(userUuid, socket.id))) {
+        return;
+      }
+
+      const lastSeen = new Date();
+      try {
+        await markUserOffline(userUuid, lastSeen);
+      } catch (error) {
+        console.error("Error during disconnect:", error);
+      }
+    });
+  });
+
+  setInterval(async () => {
+    if (!features.chat) return;
+    try {
+      // 1. Clean up stale users in database
+      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+      const [, staleUsers] = await UserStatus.update(
+        { isOnline: false, socketId: null },
+        {
+          where: {
+            isOnline: true,
+            lastSeen: { [Op.lt]: thirtyMinutesAgo },
+          },
+          returning: true,
+        },
+      );
+
+      for (const user of staleUsers) {
+        io.emit("user_status_change", {
+          userUuid: user.userUuid,
+          isOnline: false,
+          lastSeen: user.lastSeen,
+        });
+      }
+    } catch (error) {
+      console.error("Error in periodic cleanup:", error);
+    }
+  }, 60000).unref?.();
+
+  // Saved tab icons from before the folder was renamed still point at the old path.
+  app.use("/assets/cloaks", (req, res) => {
+    res.redirect(301, "/assets/harry-potter" + req.url);
+  });
+  // The old one-page-per-game play pages go to the shared play page.
+  mountLegacyPlayRedirects(app);
+  app.use(express.static(staticRoot, staticOptions));
+  // Game files that are not on disk are relayed from the 55gms/assets mirror.
+  mountGameAssetFallback(app, staticRoot);
+  app.use((req, res, next) => {
+    if (req.method === "GET" && !path.extname(req.url)) {
+      const filePath = path.join(staticRoot, req.url + ".html");
+      res.sendFile(filePath, (err) => {
+        if (err) {
+          next();
+        }
+      });
+    } else {
+      next();
+    }
+  });
+
+  const routes = [
+    { path: "/a", file: "apps.html" },
+    { path: "/g", file: "games.html" },
+    { path: "/s", file: "settings.html" },
+    { path: "/b", file: "browser.html" },
+    { path: "/", file: "index.html" },
+    { path: "/d", file: "dashboard.html" },
+    { path: "/-", file: "media.html" },
+    { path: "/m", file: "media.html" },
+    { path: "/profile", file: "account.html" },
+    { path: "/admin", file: "admin.html" },
+    { path: "/premium", file: "premium.html" },
+    { path: "/login", file: "login.html" },
+    { path: "/signup", file: "signup.html" },
+    { path: "/l", file: "/assets/404/loading.html" },
+    { path: "/c", file: "chat.html" },
+    { path: "/chat", file: "chat.html" },
+  ];
+
+  // Old address of the browser page; keep existing bookmarks working.
+  app.get("/!", (req, res) => res.redirect("/b"));
+
+  routes.forEach((route) => {
+    app.get(route.path, (req, res) => {
+      res.sendFile(path.join(staticRoot, route.file));
+    });
+  });
+
+  app.get("/chat/:chatId", (req, res) => {
+    res.sendFile(path.join(staticRoot, "chat.html"));
+  });
+
+  app.use((req, res) => {
+    const notFoundPage = path.join(staticRoot, "404.html");
+    res.status(404).sendFile(notFoundPage);
+  });
+
+  server.removeAllListeners("upgrade");
+
+  const upgradedSockets = new Set();
+
+  server.on("upgrade", (req, socket, head) => {
+    upgradedSockets.add(socket);
+    socket.once("close", () => upgradedSockets.delete(socket));
+    if (req.url.startsWith("/api/live/") || req.url.startsWith("/wisp/")) {
+      // With WISP_SERVER=external these should never reach this process.
+      if (wisp) wisp.routeRequest(req, socket, head);
+      else socket.destroy();
+    } else {
+      io.engine.handleUpgrade(req, socket, head);
+    }
+  });
+
+  server.on("listening", () => {
+    console.log(`\n------------------------------------`);
+    console.log(`🔗 URL: http://localhost:${port}`);
+    if (inCodespaces && process.env.CODESPACE_NAME) {
+      const domain =
+        process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN ||
+        "app.github.dev";
+      console.log(
+        `🌐 Codespace: https://${process.env.CODESPACE_NAME}-${port}.${domain}`,
+      );
+    }
+    console.log(`📁 Static: ${staticRoot}`);
+    console.log(`👤 Accounts: ${features.accounts ? "on" : "off"}`);
+    console.log(`💬 Chat: ${features.chat ? "on" : "off"}`);
+    console.log(`🎯 1v1.lol accounts: ${features.onev1 ? "on" : "off"}`);
+    console.log(`💾 Cloud saves: ${features.saves ? "per game" : "legacy"}`);
+    console.log(`🔌 Wisp: ${wisp ? "built in" : "external"}`);
+    console.log(`------------------------------------\n`);
+    // Tells pm2 (wait_ready) this worker can take traffic. No-op otherwise.
+    process.send?.("ready");
+  });
+
+  let shuttingDown = false;
+
+  function shutdown(signal) {
+    if (shuttingDown) {
+      console.log("  Forcing exit.");
+      process.exit(1);
+    }
+    shuttingDown = true;
+
+    console.log("-----------------------------------------------");
+    console.log(`  Shutting Down (Signal: ${signal})  `);
+    console.log("-----------------------------------------------\n");
+
+    // Don't hang forever if something refuses to close.
+    setTimeout(() => {
+      console.error("  Shutdown timed out, forcing exit.");
+      process.exit(1);
+    }, 5000).unref();
+
+    server.close(async () => {
+      console.log("  55GMS has shut down.");
+      await Promise.allSettled([
+        redisPubClient?.quit(),
+        redisSubClient?.quit(),
+      ]);
+      process.exit(0);
+    });
+
+    // server.close() waits for open connections; end them so it can finish.
+    io.close();
+    for (const socket of upgradedSockets) socket.destroy();
+    server.closeAllConnections();
+  }
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
+  configureSocketAdapter()
+    .then(async () => {
+      if (features.database) {
+        const { startMessageRetention } =
+          await import("./services/messageRetention.js");
+        startMessageRetention();
+      }
+      if (features.saves) {
+        const { startSaveRetention } = await import("./services/gameSaves.js");
+        startSaveRetention();
+      }
+      server.listen({ port });
+    })
+    .catch((error) => {
+      console.error("Failed to initialize server dependencies:", error);
+      process.exit(1);
+    });
+
+  server.on("error", (error) => {
+    console.error("Server error:", error);
+  });
+} catch (e) {
+  console.error("Failed to start server:", e);
+  process.exit(1);
+}
